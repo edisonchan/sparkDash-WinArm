@@ -138,10 +138,13 @@ if ($saved) {
 
 # ---------------------------------------------------------------- 1. setup / readiness
 step 1 "Setup: Node runtime + built frontend"
-if (-not (Test-Path $NODE)) { die "arm64 Node not found at $NODE (set NODE, or install node-arm64)" }
+if (-not $NODE -or -not (Test-Path $NODE)) { die "no Node found: set NODE to your ARM64 node.exe, or install node-arm64 at D:\llm\node-arm64, or put an ARM64 node.exe on PATH" }
 $frontend = (Test-Path (Join-Path $RepoRoot "dist\index.html"))
 if (-not $frontend) {
-    die "frontend not built: dist/index.html is missing. Run: $NODE D:\llm\node-arm64\npm.cmd run build"
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) { $npm = Get-Command npm.ps1 -ErrorAction SilentlyContinue }
+    if (-not $npm) { $npm = Get-Command npm -ErrorAction SilentlyContinue }
+    die "frontend not built: dist/index.html is missing. Build with: & '$($npm.Source)' run build   (run from the repo root with an ARM64 Node on PATH)"
 }
 log "Node at $NODE ; frontend built; no venv required (pure Node)."
 

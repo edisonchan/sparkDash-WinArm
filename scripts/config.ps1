@@ -70,11 +70,19 @@ if (Test-Path (Join-Path $RepoRoot ".env")) {
 }
 
 # ---- Node runtime ------------------------------------------------------------------
-# ARM64-native Node lives in D:\llm\node-arm64. Override with $env:NODE if you keep it elsewhere.
-# The arm64 build is the only one that runs natively on GB10; the repo's x64 build falls back
-# to emulated x86 and is unusably slow.
+# Resolution: $env:NODE (when it points at a real file) -> the arm64 build at
+# D:\llm\node-arm64 (this machine's layout) -> any node.exe on PATH. The arm64 build is the
+# only one that runs natively on GB10; the x64 build falls back to emulated x86 and is
+# unusably slow.
 $NODE_DEFAULT = "D:\llm\node-arm64\node.exe"
-$NODE = Get-EnvOr NODE $NODE_DEFAULT
+$nodeEnv = [Environment]::GetEnvironmentVariable("NODE", "Process")
+$NODE = $null
+if ($nodeEnv -and (Test-Path $nodeEnv)) { $NODE = $nodeEnv }
+elseif (Test-Path $NODE_DEFAULT) { $NODE = $NODE_DEFAULT }
+else {
+    $found = Get-Command node.exe -ErrorAction SilentlyContinue
+    if ($found) { $NODE = $found.Source }
+}
 
 # ---- endpoint ---------------------------------------------------------------------
 # NB: $Host is a read-only automatic variable in PowerShell, so the listen address is BIND_HOST.
