@@ -194,9 +194,9 @@ export function BenchCopyButton({
   };
 
   /**
-   * Show the card as an image, in the page. On a page with no image clipboard
-   * this is the only route to a real image on the pasteboard: the browser's own
-   * right-click → Copy Image and drag-out both work from what is on screen.
+   * Show the card as an image, in the page. Always offered: even where the PNG
+   * can be written straight to the clipboard, an on-screen preview is worth one
+   * click (right-click → Copy Image, drag-out, or the preview's own Download).
    * A popup would be the other option, but popups get blocked (and cannot be
    * verified from here), and an in-page image is draggable anyway.
    */
@@ -319,36 +319,26 @@ export function BenchCopyButton({
             >
               {t("copy.asText")}
             </button>
-            {imageClipboard ? (
-              <button
-                type="button"
-                role="menuitem"
-                className="block w-full rounded px-2 py-1.5 text-left text-[11px] text-muted transition-colors hover:bg-surface-hover hover:text-text"
-                onClick={() => void copyImage()}
-              >
-                {t("copy.asImage")}
-              </button>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="block w-full rounded px-2 py-1.5 text-left text-[11px] text-muted transition-colors hover:bg-surface-hover hover:text-text"
-                  onClick={() => void showImage()}
-                  title={t("copy.showHint")}
-                >
-                  {t("copy.showCard")}
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  className="block w-full rounded px-2 py-1.5 text-left text-[11px] text-muted transition-colors hover:bg-surface-hover hover:text-text"
-                  onClick={() => void copyImage()}
-                >
-                  {t("copy.download")}
-                </button>
-              </>
-            )}
+            {/* The in-page preview is useful in every context. It used to appear
+                only when the image clipboard was unavailable, which made it
+                vanish after a browser/OS change made ClipboardItem available. */}
+            <button
+              type="button"
+              role="menuitem"
+              className="block w-full rounded px-2 py-1.5 text-left text-[11px] text-muted transition-colors hover:bg-surface-hover hover:text-text"
+              onClick={() => void showImage()}
+              title={t("copy.showHint")}
+            >
+              {t("copy.showCard")}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              className="block w-full rounded px-2 py-1.5 text-left text-[11px] text-muted transition-colors hover:bg-surface-hover hover:text-text"
+              onClick={() => void copyImage()}
+            >
+              {imageClipboard ? t("copy.asImage") : t("copy.download")}
+            </button>
           </span>,
           document.body
         )}

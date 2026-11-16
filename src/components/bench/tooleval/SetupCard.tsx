@@ -85,9 +85,12 @@ export function SetupCard({ spark, spec, status, loading, error, reload, busy }:
     );
   }
   // Local Windows unit installs with pip into its venv (uv is not involved).
-  // Remote units still use uv.
+  // Remote units still use uv. A failed status check is NOT evidence that uv is
+  // missing — that case shows the real connection error above.
   const isLocalWin = spark.isLocal && spark.platform === "windows";
-  const uvMissing = isLocalWin ? !status.python : !status.uv;
+  const usesVenv = isLocalWin;
+  const statusFailed = status.reachable === false;
+  const uvMissing = !statusFailed && (usesVenv ? !status.python : !status.uv);
   const failedText = install.lines.map((l) => l.text).join("\n");
   const uvProblem = install.job?.status === "failed" && /uv: (command )?not found|uv is not installed|virtual environment was not found|No such file/i.test(failedText);
 
@@ -102,21 +105,19 @@ export function SetupCard({ spark, spec, status, loading, error, reload, busy }:
       </div>
       <p className="te-note">
         {installed && !forceReinstall ? (
-          <>
-            {t("setup.upgradeHelp", { name: spark.name })}
-          </>
+          usesVenv ? t("setup.upgradeHelpVenv", { name: spark.name }) : t("setup.upgradeHelp", { name: spark.name })
         ) : (
-          <>
-            {t("setup.installHelp", { name: spark.name })}
-          </>
+          usesVenv ? t("setup.installHelpVenv", { name: spark.name }) : t("setup.installHelp", { name: spark.name })
         )}{" "}
-        {t("ui.setup.internetNote")}
+        {usesVenv ? t("ui.setup.internetNoteVenv") : t("ui.setup.internetNote")}
       </p>
       {uvMissing ? (
-        <Notice tone="warn" title={isLocalWin ? t("ui.setup.venvMissing") : t("ui.setup.uvMissing")}>
-          {isLocalWin
+        <Notice tone="warn" title={usesVenv ? t("ui.setup.venvMissing") : t("ui.setup.uvMissing")}>
+          {usesVenv
             ? t("setup.venvHelp", { venv: status?.venv ?? "the configured venv" })
-            : spark.platform === "darwin" ? t("setup.uvHelpDarwin") : t("setup.uvHelp")}
+            : spark.platform === "windows"
+              ? t("setup.uvHelpWindows")
+              : spark.platform === "darwin" ? t("setup.uvHelpDarwin") : t("setup.uvHelp")}
         </Notice>
       ) : null}
       {install.job ? (
@@ -131,7 +132,9 @@ export function SetupCard({ spark, spec, status, loading, error, reload, busy }:
           {install.job.status === "completed" ? <p className="te-ok" role="status">{t("ui.setup.doneChecking")}</p> : null}
           {install.job.status === "failed" ? (
             <Notice tone="bad" title={t("ui.setup.installDidNotFinish")}>
-              {uvProblem ? t("ui.setup.uvNotFound") : install.job.error ?? t("ui.setup.installFailureHint")}
+              {uvProblem
+                ? usesVenv ? t("ui.setup.venvNotFound") : t("ui.setup.uvNotFound")
+                : install.job.error ?? t("ui.setup.installFailureHint")}
             </Notice>
           ) : null}
         </div>

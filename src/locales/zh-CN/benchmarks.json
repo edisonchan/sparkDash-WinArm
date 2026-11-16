@@ -70,8 +70,8 @@
     "idle": "复制结果", "working": "正在复制…", "image": "图片已复制！", "downloaded": "PNG 已保存", "shown": "已显示卡片", "text": "文本已复制！", "textShort": "已复制！",
     "errorText": "无法将结果复制到剪贴板", "errorImage": "无法将图片复制到剪贴板", "errorRender": "无法渲染卡片图片——浏览器返回了空白画布。画布指纹保护（浏览器设置或隐私扩展）阻止了绘制；请允许本站访问画布后重试",
     "textTitle": "将纯文本摘要复制到剪贴板", "buttonTitle": "将结果复制为纯文本；右侧箭头复制分享卡片图片", "format": "复制格式",
-    "imageTitle": "复制为文本或图片", "showTitle": "复制为文本，或显示/下载图片", "asText": "复制为文本", "asImage": "复制为图片", "showCard": "显示卡片", "download": "下载 PNG",
-    "showHint": "此页面通过局域网 HTTP 地址提供服务，浏览器无法直接将图片写入剪贴板。因此改为显示卡片图片；可右键复制图片，或将它拖入帖子。",
+    "imageTitle": "复制为文本、显示卡片或复制为图片", "showTitle": "复制为文本，或显示/下载图片", "asText": "复制为文本", "asImage": "复制为图片", "showCard": "显示卡片", "download": "下载 PNG",
+    "showHint": "在页面中显示分享卡片图片 — 可右键复制图片、拖入帖子，或从预览窗口下载 PNG。",
     "cardLabel": "基准测试分享卡片", "cardAlt": "基准测试结果卡片 — 右键复制", "previewBefore": "右键 → ", "copyImage": "复制图片", "previewAfter": "，或将卡片拖入帖子。浏览器仅允许网页通过 HTTPS 或 localhost 复制图片，因此在这里显示卡片供浏览器复制。"
   },
   "prefill": {

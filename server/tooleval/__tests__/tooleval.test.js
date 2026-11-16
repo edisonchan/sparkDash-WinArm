@@ -9,6 +9,7 @@ import { ARG_SPEC, publicSpec, specByName } from "../spec.js";
 import { ToolEvalManager, reduceProgress, emptyProgress, summarizeResult } from "../ToolEvalManager.js";
 import { ToolEvalStore, isValidRunId, newRunId } from "../ToolEvalStore.js";
 import { buildRunProgram, installCommandLine, secretsPayload } from "../commands.js";
+import { expandArgvHomeWindows } from "../../util/windowsCommands.js";
 import { installFakeTool } from "./fakeTool.js";
 
 const tmp = (p) => fs.mkdtempSync(path.join(os.tmpdir(), p));
@@ -471,4 +472,19 @@ test("stale pid: an existing exit file means the run is not alive, and the wrapp
   assert.equal(check.state, "finished");
   const stop = await mgr.stopRun(spark, id);
   assert.match(stop.output, /not running/);
+});
+
+test("windows: a ~/ path after a path flag becomes absolute so result.json lands where read-result looks", () => {
+  const argv = ["--hardmode", "--base-url", "http://127.0.0.1:8888", "--json-file", "~/.cache/sparkdash/tooleval/te-test/result.json", "--no-live"];
+  const b64 = Buffer.from(argv.join("\0") + "\0", "utf8").toString("base64");
+  const out = Buffer.from(expandArgvHomeWindows(b64), "base64").toString("utf8").split("\0").filter(Boolean);
+  assert.equal(out[4], path.win32.join(os.homedir(), ".cache\\sparkdash\\tooleval\\te-test\\result.json"));
+  assert.equal(out[2], "http://127.0.0.1:8888"); // non-path values are untouched
+  assert.equal(out[0], "--hardmode");
+  assert.equal(out[5], "--no-live"); // trailing NUL round-trips
+  // Free text that merely starts with "~/" is not a path-flag value.
+  const plain = Buffer.from(["--system-prompt", "~/not/a/path", "--json-file", "C:\\tmp\\result.json", ""].join("\0"), "utf8").toString("base64");
+  const plainOut = Buffer.from(expandArgvHomeWindows(plain), "base64").toString("utf8").split("\0");
+  assert.equal(plainOut[1], "~/not/a/path");
+  assert.equal(plainOut[3], "C:\\tmp\\result.json");
 });

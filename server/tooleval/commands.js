@@ -17,7 +17,7 @@ export const TE_EXIT = "__TEEXIT__";
 export const exitToken = (nonce = "") => `${TE_EXIT}${nonce}:`;
 
 /** Flags whose NEXT argument is a path on the Spark, where a leading "~/" means $HOME. */
-const PATH_FLAGS = ["--json-file", ...ARG_SPEC.filter((s) => s.kind === "path" || s.name === "scenario-pack").map((s) => s.flag)];
+export const PATH_FLAGS = ["--json-file", ...ARG_SPEC.filter((s) => s.kind === "path" || s.name === "scenario-pack").map((s) => s.flag)];
 const PATH_CASE = PATH_FLAGS.join("|");
 /** bash: expand "~/" only for the argument right after a path flag (never in free text such as a system prompt). */
 const EXPAND_HOME = `

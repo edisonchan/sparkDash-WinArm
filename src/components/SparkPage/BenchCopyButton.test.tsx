@@ -99,7 +99,7 @@ describe("with the share image on", () => {
     click(caret);
     expect(menuEl()).toBeTruthy();
     expect(caret.getAttribute("aria-expanded")).toBe("true");
-    expect(menuItems()).toEqual(["Copy as text", "Copy as image"]);
+    expect(menuItems()).toEqual(["Copy as text", "Show card", "Copy as image"]);
 
     const imageItem = Array.from(document.querySelectorAll('[role="menuitem"]')).find(
       (el) => (el.textContent || "").trim() === "Copy as image"

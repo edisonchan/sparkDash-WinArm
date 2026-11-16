@@ -21,10 +21,23 @@
  *   - a value the dashboard itself must inject (a nonce, a base64 payload, a
  *     marker prefix) is a normal ${} interpolation.
  */
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { IS_WINDOWS_HOST } from "./windowsProgram.js";
 import { TOOL_EVAL_VENV } from "../config.js";
+import { PATH_FLAGS } from "../tooleval/commands.js";
 
 export { IS_WINDOWS_HOST };
+/**
+ * The detached run wrapper is a real file, not an inline -EncodedCommand:
+ * nesting a script inside a script multiplies the command line by ~7x and
+ * overflows Windows' 32767-character limit on realistic argument lists.
+ */
+const RUN_WRAPPER_PS1 = path.join(
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."),
+  "scripts", "windows", "tool-eval-run-wrapper.ps1"
+);
 const IS_LOCAL_WINDOWS = IS_WINDOWS_HOST;
 /** The local unit's tool-eval-bench virtual environment (installed with pip, never uv). */
 const VENV = TOOL_EVAL_VENV;
@@ -39,6 +52,32 @@ const PATH_LOOKUP = (name) => `(Get-Command ${name} -ErrorAction SilentlyContinu
 
 /** A literal single-quoted PowerShell string (no interpolation, '' escapes a quote). */
 const psQuote = (s) => `'${String(s).replace(/'/g, "''")}'`;
+
+/**
+ * The bash programs expand "~/" in the argument after a path flag (EXPAND_HOME
+ * in tooleval/commands.js). tool-eval-bench does NOT expand it itself:
+ * emit_json_output() writes to Path(json_file) verbatim. On Windows the result
+ * therefore used to land in <work dir>\~\.cache\...\result.json, while
+ * buildReadResultProgramWindows() reads $HOME\.cache\...\result.json — a run
+ * finished with exit 0 but the Results tab said "No result file exists".
+ *
+ * Expand here, on the host, exactly like the bash program does: only values
+ * following a path flag, only a leading "~/" or "~\". URLs, prompts and other
+ * free text keep their slashes. The PowerShell child runs under the same user
+ * profile as this process, so os.homedir() and the child's $HOME are identical.
+ */
+export function expandArgvHomeWindows(argvB64) {
+  if (!argvB64) return argvB64;
+  const home = os.homedir();
+  const flags = new Set(PATH_FLAGS);
+  const parts = Buffer.from(argvB64, "base64").toString("utf8").split("\0");
+  for (let i = 1; i < parts.length; i += 1) {
+    const value = parts[i];
+    if (!flags.has(parts[i - 1]) || !/^~[\\/]/.test(value)) continue;
+    parts[i] = path.win32.join(home, value.slice(2).replace(/\//g, "\\"));
+  }
+  return Buffer.from(parts.join("\0"), "utf8").toString("base64");
+}
 
 /**
  * Preamble shared by every Tool Eval program.
@@ -89,19 +128,73 @@ function killTree(varName = "runPid") {
   ].join("\n");
 }
 
-/** Tail a log file, emitting only new lines, until the exit file appears. */
-function followTail(maxMs) {
+/**
+ * Read the dashboard's `NAME=base64(value)` secret block from stdin into this
+ * process's environment. The detached run wrapper inherits it from here, so the
+ * API key never appears on a command line. A blank line ends the block, matching
+ * secretsPayload(). Reading stdin once and splitting is required: ReadToEnd()
+ * returns the WHOLE block, so looping over it as if it were one line per read
+ * silently mangles every secret after the first.
+ */
+const TE_READ_SECRETS = [
+  `$secretBlock = [Console]::In.ReadToEnd()`,
+  `foreach ($secretLine in ($secretBlock -split "${BT}r?${BT}n")) {`,
+  `  if ($secretLine -eq "") { break }`,
+  `  $eq = $secretLine.IndexOf("=")`,
+  `  if ($eq -le 0) { continue }`,
+  `  $k = $secretLine.Substring(0, $eq); $v64 = $secretLine.Substring($eq + 1)`,
+  `  if ($k -in @("TOOL_EVAL_API_KEY","TOOL_EVAL_HEADERS")) {`,
+  `    try { [Environment]::SetEnvironmentVariable($k, [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($v64)), "Process") } catch {}`,
+  `  }`,
+  `}`,
+].join("\n");
+
+/**
+ * Shared log helpers for the Tool Eval programs.
+ *
+ * On Linux `tail -n +1 "$E" "$L"` prefixes each file with a `==> <file> <==`
+ * header; ToolEvalManager._line uses that header (a path ending in
+ * events.jsonl) to route stderr JSON into the progress reducer. Emit-TeLine
+ * reproduces the same shape, otherwise every progress event would be shown as
+ * a plain stdout line and the progress panel would never update.
+ *
+ * Logs are written with an explicit BOM-free UTF-8 encoding. PowerShell 5.1's
+ * `>` / `Out-File` default is UTF-16LE, which corrupts JSONL on read-back.
+ */
+const TE_LOG_HELPERS = [
+  `$script:teUtf8 = New-Object System.Text.UTF8Encoding $false`,
+  `$script:teSrc = $null`,
+  `$script:teLPos = 0; $script:teEPos = 0`,
+  `function Emit-TeLine([string]$stream, [string]$text) {`,
+  `  if ($script:teSrc -ne $stream) { Write-Output ("==> " + $stream + " <=="); $script:teSrc = $stream }`,
+  `  Write-Output $text`,
+  `}`,
+  `function Dump-TeLogs() {`,
+  `  if (Test-Path $E) { $el = @(Get-Content $E -Encoding UTF8 -ErrorAction SilentlyContinue); if ($el.Count -gt $script:teEPos) { foreach ($x in $el[$script:teEPos..($el.Count-1)]) { Emit-TeLine $E ([string]$x) }; $script:teEPos = $el.Count } }`,
+  `  if (Test-Path $L) { $ol = @(Get-Content $L -Encoding UTF8 -ErrorAction SilentlyContinue); if ($ol.Count -gt $script:teLPos) { foreach ($x in $ol[$script:teLPos..($ol.Count-1)]) { Emit-TeLine $L ([string]$x) }; $script:teLPos = $ol.Count } }`,
+  `}`,
+].join("\n");
+
+/**
+ * Follow stdout.log + events.jsonl until the exit file appears.
+ * `watchPid` makes the loop give up if the detached child died without writing
+ * an exit code; `whileExpr` lets attach stop after a one-shot dump when the run
+ * is no longer alive.
+ */
+function teFollow(maxMs, { watchPid = null, whileExpr = null } = {}) {
   return [
-    `function FollowTail($L, $X, $MaxMs) {`,
-    `  $deadline = (Get-Date).AddMilliseconds($MaxMs)`,
-    `  $lPos = 0`,
-    `  while ((Get-Date) -lt $deadline) {`,
-    `    if (Test-Path $L) { $lines = @(Get-Content $L -ErrorAction SilentlyContinue); if ($lines.Count -gt $lPos) { foreach ($x in $lines[$lPos..($lines.Count-1)]) { Write-Output $x }; $lPos = $lines.Count } }`,
-    `    if ($X -and (Test-Path $X)) { break }`,
-    `    Start-Sleep -Milliseconds 700`,
-    `  }`,
+    `$deadline = (Get-Date).AddMilliseconds(${maxMs})`,
+    `Dump-TeLogs`,
+    `while ((Get-Date) -lt $deadline${whileExpr ? ` -and ${whileExpr}` : ""}) {`,
+    `  if (Test-Path $X) { break }`,
+    watchPid
+      ? `  if (-not (Get-Process -Id ${watchPid} -ErrorAction SilentlyContinue)) { Start-Sleep -Milliseconds 500; Dump-TeLogs; break }`
+      : null,
+    `  Start-Sleep -Milliseconds 700`,
+    `  Dump-TeLogs`,
     `}`,
-  ].join("\n");
+    `Dump-TeLogs`,
+  ].filter((x) => x !== null).join("\n");
 }
 
 function teMarker(nonce) {
@@ -130,7 +223,9 @@ export function buildStatusProgramWindows() {
     `Write-Output "UV="`,
     `if (Test-Path $PY) { Write-Output "PYTHON=$PY"; $pv = (& $PY --version 2>&1); Write-Output "PYTHON_VERSION=$pv" } else { Write-Output "PYTHON=" }`,
     `Write-Output "VENV=$VENV"`,
-    `$wd = Join-Path $HOME ".sparkdash\\tool-eval"`,
+    // Same directory the run wrapper uses as its working directory (mirrors WORK_DIR
+    // in the bash programs), so the status card does not report a different path.
+    `$wd = Join-Path $HOME ".local\\share\\sparkdash\\tool-eval"`,
     `Write-Output "WORKDIR=$wd"`,
     ``,
   ].join("\n");
@@ -138,29 +233,24 @@ export function buildStatusProgramWindows() {
 
 /** One-shot tool call (probe / dry-run / version) with base64 NUL-joined argv. */
 export function buildOnceProgramWindows({ argvB64, wantStdin = false, nonce = "" }) {
-  const readSecrets = wantStdin
-    ? [
-        `  while (($line = [Console]::In.ReadToEnd()) -ne $null) {`,
-        `    $line = $line.TrimEnd("${BT}r"${BT}n")`,
-        `    if ($line -eq "") { break }`,
-        `    $i = $line.IndexOf("="); if ($i -gt 0) { $k = $line.Substring(0,$i); $v = $line.Substring($i+1); if ($k -in @("TOOL_EVAL_API_KEY","TOOL_EVAL_HEADERS")) { [Environment]::SetEnvironmentVariable($k, [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($v)), "Process") } }`,
-        `  }`,
-      ].join("\n")
-    : "";
   return [
-    readSecrets,
+    wantStdin ? TE_READ_SECRETS : "",
     VENV_BOOTSTRAP,
     `$bin = ${VENV_BIN_LOOKUP}`,
     `if (-not $bin) { Write-Output "tool-eval-bench is not installed in ${VENV}"; Write-Output "${teMarker(nonce)}127"; exit 0 }`,
-    `$argv = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${argvB64}')).Split("${BT}0") | Where-Object { $_.Length -gt 0 }`,
-    `$wd = Join-Path $HOME ".sparkdash\\tool-eval"`,
+    // @(...) is mandatory: a single argument would otherwise unwrap to a scalar
+    // string, and splatting a string makes PowerShell pass only its first char.
+    `$argv = @([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${argvB64}')).Split("${BT}0") | Where-Object { $_.Length -gt 0 })`,
+    `$wd = Join-Path $HOME ".local\\share\\sparkdash\\tool-eval"`,
     `New-Item -ItemType Directory -Force -Path $wd | Out-Null`,
     `Push-Location $wd`,
+    // Invoke the CLI directly. Start-Process -PassThru returns $null for ExitCode
+    // on Windows PowerShell 5.1, and -NoNewWindow / -WindowStyle are mutually
+    // exclusive; $LASTEXITCODE from the native call is the reliable exit status.
     `try {`,
-    `  $p = Start-Process -FilePath $bin -ArgumentList $argv -NoNewWindow -PassThru -WindowStyle Hidden`,
-    `  $p.WaitForExit(90000)`,
-    `  $code = $p.ExitCode`,
-    `} catch { $code = 1 } finally { Pop-Location }`,
+    `  & $bin @argv 2>&1 | ForEach-Object { Write-Output ([string]$_.ToString()) }`,
+    `  $code = $LASTEXITCODE; if ($null -eq $code) { $code = 0 }`,
+    `} catch { $code = 1; Write-Output ([string]$_.Exception.Message) } finally { Pop-Location }`,
     `Write-Output "${teMarker(nonce)}$code"`,
     ``,
   ].join("\n");
@@ -233,38 +323,68 @@ export function buildInstallProgramWindows({ extras = [], upgrade = false, nonce
   ].join("\n");
 }
 
-/** Start a detached benchmark run and follow its output. */
+/**
+ * Start a DETACHED benchmark run and follow its output.
+ *
+ * The run lives in its own PowerShell wrapper process (matching the upstream
+ * `setsid` design), so restarting sparkDash does not kill a long benchmark.
+ * The wrapper invokes the CLI directly, splits native stdout/stderr line by
+ * line into BOM-free UTF-8 logs, and writes its own exit code / pid. That
+ * avoids three Windows PowerShell 5.1 traps in the old Start-Process version:
+ *   - `-NoNewWindow` and `-WindowStyle` are mutually exclusive (hard error);
+ *   - `-PassThru` gives $null for ExitCode, so the exit marker was empty;
+ *   - `-RedirectStandardOutput` truncates the log, wiping the display line.
+ */
 export function buildRunProgramWindows({ runId, argvB64, displayLine, nonce = "" }) {
   const rd = `$HOME\\.cache\\sparkdash\\tooleval\\${runId}`;
   const wd = `$HOME\\.local\\share\\sparkdash\\tool-eval`;
   const display = Buffer.from(String(displayLine ?? ""), "utf8").toString("base64");
+
+  // Windows PowerShell 5.1 is required: its `2>&1` wraps native stderr in
+  // ErrorRecord, which the wrapper uses to separate the JSONL event stream.
+  const psExe = `Join-Path $env:SystemRoot "System32\\WindowsPowerShell\\v1.0\\powershell.exe"`;
+  const wrapperPathLiteral = psQuote(RUN_WRAPPER_PS1);
+  const wrapperArgLiteral = psQuote(`"${RUN_WRAPPER_PS1}"`);
+
   return [
     VENV_BOOTSTRAP,
-    `function DecodeB64([string]$s) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) }`,
-    killTree("runPid"),
+    // The detached wrapper inherits this process's environment, so secrets handed
+    // over on stdin reach the benchmark without ever appearing in a command line.
+    TE_READ_SECRETS,
+    TE_LOG_HELPERS,
     `$RD = "${rd}"; $WD = "${wd}"`,
     `New-Item -ItemType Directory -Force -Path $RD | Out-Null`,
     `New-Item -ItemType Directory -Force -Path $WD | Out-Null`,
     `$L = "$RD\\stdout.log"; $E = "$RD\\events.jsonl"; $X = "$RD\\exit"; $P = "$RD\\pid"`,
-    // The venv Scripts dir is first on PATH, so the console shim runs under the venv python.
     `$bin = ${VENV_BIN_LOOKUP}`,
     `if (-not $bin) { Write-Output "[sparkdash] tool-eval-bench is not installed in ${VENV}. Use Set up on the Tool Eval page to install it."; Write-Output "${teMarker(nonce)}127"; exit 0 }`,
     `$runPid = 0; if (Test-Path $P) { $v=[int](Get-Content $P -ErrorAction SilentlyContinue | Select-Object -First 1); if($v){$runPid=$v} }`,
     `if ($runPid -gt 0 -and (Get-Process -Id $runPid -ErrorAction SilentlyContinue)) { Write-Output "[sparkdash] this run is already running"; Write-Output "${teMarker(nonce)}-1"; exit 0 }`,
-    `$argv = (DecodeB64 '${argvB64}').Split("${BT}0") | Where-Object { $_.Length -gt 0 }`,
-    `Push-Location $WD`,
+    `if (Test-Path $X) { Remove-Item $X -Force }`,
+    // Run-specific values travel through the environment (inherited by the
+    // child), not through the command line. The wrapper script is static, so a
+    // long argv can never overflow the 32767-char CreateProcess limit.
+    `$env:SPARKDASH_TE_RUN_DIR = $RD`,
+    `$env:SPARKDASH_TE_WORK_DIR = $WD`,
+    `$env:SPARKDASH_TE_VENV = $VENV`,
+    `$env:SPARKDASH_TE_ARGV_B64 = '${argvB64}'`,
+    `$env:SPARKDASH_TE_DISPLAY_B64 = '${display}'`,
+    `$wrapperPath = ${wrapperPathLiteral}`,
+    `if (-not (Test-Path $wrapperPath)) { Write-Output "[sparkdash] the run wrapper is missing: $wrapperPath"; Write-Output "${teMarker(nonce)}127"; exit 0 }`,
+    `$psExe = ${psExe}`,
+    `if (-not (Test-Path $psExe)) { Write-Output "[sparkdash] Windows PowerShell 5.1 was not found at $psExe"; Write-Output "${teMarker(nonce)}127"; exit 0 }`,
+    // PowerShell variable names are case-insensitive: never call this $p, it
+    // would overwrite the $P pid-file path defined above.
     `try {`,
-    `  if (Test-Path $X) { Remove-Item $X -Force }`,
-    `  Set-Content -Path $L -Value "[sparkdash] " + (DecodeB64 '${display}') -NoNewline`,
-    `  $p = Start-Process -FilePath $bin -ArgumentList $argv -NoNewWindow -PassThru -WindowStyle Hidden -RedirectStandardOutput $L -RedirectStandardError $E`,
-    `  $runPid = $p.Id`,
-    `  Set-Content -Path $P -Value $runPid`,
-    `  $p.WaitForExit()`,
-    `  $code = $p.ExitCode`,
-    `  Set-Content -Path $X -Value $code`,
-    `  Remove-Item $P -Force -ErrorAction SilentlyContinue`,
-    `  Write-Output "${teMarker(nonce)}$code"`,
-    `} finally { Pop-Location }`,
+    `  $wrapperProc = Start-Process -FilePath $psExe -ArgumentList @("-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",${wrapperArgLiteral}) -PassThru -WindowStyle Hidden`,
+    `} catch {`,
+    `  Write-Output ("[sparkdash] could not start the run: " + [string]$_.Exception.Message)`,
+    `  Write-Output "${teMarker(nonce)}127"; exit 0`,
+    `}`,
+    teFollow(12 * 60 * 60 * 1000, { watchPid: "$wrapperProc.Id" }),
+    `$code = -1; if (Test-Path $X) { $code = [int](Get-Content $X | Select-Object -First 1) }`,
+    `Remove-Item $P -Force -ErrorAction SilentlyContinue`,
+    `Write-Output "${teMarker(nonce)}$code"`,
     ``,
   ].join("\n");
 }
@@ -274,16 +394,14 @@ export function buildAttachProgramWindows({ runId, nonce = "" }) {
   const rd = `$HOME\\.cache\\sparkdash\\tooleval\\${runId}`;
   return [
     `$ErrorActionPreference = "Continue"`,
-    followTail(0),
+    TE_LOG_HELPERS,
     `$RD = "${rd}"`,
     `$L = "$RD\\stdout.log"; $E = "$RD\\events.jsonl"; $X = "$RD\\exit"; $P = "$RD\\pid"`,
     `if (-not (Test-Path $L)) { Write-Output "[sparkdash] no output was recorded for this run on the Spark"; Write-Output "${teMarker(nonce)}-1"; exit 0 }`,
     `$runPid = 0; if (Test-Path $P) { $v=[int](Get-Content $P -ErrorAction SilentlyContinue | Select-Object -First 1); if($v){$runPid=$v} }`,
     `$alive = ($runPid -gt 0) -and (Get-Process -Id $runPid -ErrorAction SilentlyContinue) -and (-not (Test-Path $X))`,
-    `if ($alive) { FollowTail $L $X 3600000 } else {`,
-    `  $t = @(Get-Content $L -ErrorAction SilentlyContinue); if ($t) { foreach ($x in $t) { Write-Output $x } }`,
-    `  $e = @(Get-Content $E -ErrorAction SilentlyContinue); if ($e) { foreach ($x in $e) { Write-Output $x } }`,
-    `}`,
+    // A finished run gets one dump; a live run keeps following until exit appears.
+    teFollow(3600000, { whileExpr: "$alive" }),
     `$code = -1; if (Test-Path $X) { $code = [int](Get-Content $X | Select-Object -First 1) }`,
     `Write-Output "${teMarker(nonce)}$code"`,
     ``,
@@ -319,7 +437,7 @@ export function buildReadResultProgramWindows({ runId, maxBytes = 30 * 1024 * 10
     `if (-not (Test-Path $R)) { Write-Output "__NORESULT__"; exit 0 }`,
     `$sz = (Get-Item $R).Length`,
     `if ($sz -gt ${maxBytes}) { Write-Output "__TOOBIG__$sz"; exit 0 }`,
-    `Write-Output (Get-Content $R -Raw)`,
+    `Write-Output (Get-Content $R -Raw -Encoding UTF8)`,
     ``,
   ].join("\n");
 }
@@ -354,7 +472,10 @@ export function buildDeleteRunProgramWindows({ runId }) {
 /** Build a Tool Eval program; PowerShell when local+Windows, else null (use bash). */
 export function teProgramWindows(action, opts = {}) {
   if (!IS_LOCAL_WINDOWS) return null; // caller falls back to the bash builder
-  const program = buildTeProgramWindows(action, opts);
+  // run/once receive the same NUL-joined argv the bash programs get; do the
+  // path-flag "~/" expansion here so --json-file writes where read-result looks.
+  const windowsOpts = opts.argvB64 ? { ...opts, argvB64: expandArgvHomeWindows(opts.argvB64) } : opts;
+  const program = buildTeProgramWindows(action, windowsOpts);
   // One preamble for every action: UTF-8 output, no progress stream. Builders that
   // already start with it (the venv ones) are left alone.
   return program.includes(PS_HEADER) ? program : `${PS_HEADER}\n${program}`;
