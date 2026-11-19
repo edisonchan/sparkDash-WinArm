@@ -298,7 +298,9 @@ export class LauncherManager {
       cmd = sdCmd(spark, "attach", { id: launcher.id, nonce });
       maxMs = START_WATCH_MAX_MS;
     } else {
-      cmd = sdCmd(spark, "stop", { dir: launcher.dir, script: launcher.stopScript, nonce });
+      // Keep the Windows sdCmd branch; pass `id` so the non-Windows fallback
+      // (buildStopCommand) can also tear down a start script still awaiting readiness.
+      cmd = sdCmd(spark, "stop", { id: launcher.id, dir: launcher.dir, script: launcher.stopScript, nonce });
       maxMs = STOP_MAX_MS;
     }
     const markerPrefix = exitPrefix(nonce);
